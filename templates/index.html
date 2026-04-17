@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>sherpa-onnx 实时语音识别</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            max-width: 700px;
+            width: 100%;
+            padding: 40px;
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+            margin-bottom: 10px;
+            font-size: 28px;
+        }
+        .subtitle {
+            text-align: center;
+            color: #666;
+            margin-bottom: 30px;
+        }
+        .status {
+            background: #f0f4ff;
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .status-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #10b981;
+            animation: pulse 2s infinite;
+        }
+        .status-dot.offline {
+            background: #ef4444;
+            animation: none;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        .record-btn {
+            width: 100%;
+            padding: 20px;
+            font-size: 20px;
+            border: none;
+            border-radius: 12px;
+            cursor: pointer;
+            transition: all 0.3s;
+            background: #10b981;
+            color: white;
+            font-weight: 600;
+        }
+        .record-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(16, 185, 129, 0.3);
+        }
+        .record-btn.recording {
+            background: #ef4444;
+        }
+        .record-btn.recording:hover {
+            box-shadow: 0 10px 20px rgba(239, 68, 68, 0.3);
+        }
+        .result-box {
+            margin-top: 25px;
+            background: #f9fafb;
+            border: 2px solid #e5e7eb;
+            border-radius: 12px;
+            padding: 20px;
+            min-height: 120px;
+        }
+        .result-title {
+            color: #666;
+            font-size: 14px;
+            margin-bottom: 10px;
+            font-weight: 600;
+        }
+        .result-text {
+            color: #1f2937;
+            font-size: 18px;
+            line-height: 1.6;
+            word-wrap: break-word;
+        }
+        .result-text.empty {
+            color: #9ca3af;
+            font-style: italic;
+        }
+        .info {
+            margin-top: 20px;
+            padding: 15px;
+            background: #fffbeb;
+            border-radius: 10px;
+            border-left: 4px solid #f59e0b;
+        }
+        .info p {
+            color: #92400e;
+            font-size: 14px;
+            line-height: 1.6;
+        }
+        .waveform {
+            margin-top: 20px;
+            height: 60px;
+            background: #f3f4f6;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 4px;
+            overflow: hidden;
+        }
+        .wave-bar {
+            width: 4px;
+            background: #667eea;
+            border-radius: 2px;
+            transition: height 0.1s;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎤 实时语音识别</h1>
+        <p class="subtitle">基于 sherpa-onnx · GPU 加速</p>
+
+        <div class="status">
+            <div class="status-dot" id="statusDot"></div>
+            <span id="statusText">正在连接...</span>
+        </div>
+
+        <button class="record-btn" id="recordBtn">
+            🎙️ 开始录音
+        </button>
+
+        <div class="waveform" id="waveform" style="display: none;">
+        </div>
+
+        <div class="result-box">
+            <div class="result-title">识别结果</div>
+            <div class="result-text empty" id="resultText">等待输入...</div>
+        </div>
+
+        <div class="info">
+            <p><strong>提示：</strong>首次访问时浏览器会请求麦克风权限，请点击"允许"。这是自签名证书，浏览器可能会提示安全警告，点击"高级" → "继续访问"即可。</p>
+        </div>
+    </div>
+
+    <script>
+        let mediaRecorder = null;
+        let audioChunks = [];
+        let isRecording = false;
+        let audioContext = null;
+        let analyser = null;
+        let animationId = null;
+
+        const recordBtn = document.getElementById('recordBtn');
+        const resultText = document.getElementById('resultText');
+        const statusDot = document.getElementById('statusDot');
+        const statusText = document.getElementById('statusText');
+        const waveform = document.getElementById('waveform');
+
+        // 检查服务状态
+        async function checkStatus() {
+            try {
+                const response = await fetch('/api/status');
+                const data = await response.json();
+                if (data.status === 'ok' && data.model_loaded) {
+                    statusDot.classList.remove('offline');
+                    statusText.textContent = '服务就绪 · ' + (data.provider === 'cuda' ? 'GPU 加速' : 'CPU');
+                } else {
+                    statusDot.classList.add('offline');
+                    statusText.textContent = '模型未加载';
+                }
+            } catch (e) {
+                statusDot.classList.add('offline');
+                statusText.textContent = '连接失败';
+            }
+        }
+
+        // 初始化波形显示
+        function initWaveform() {
+            waveform.innerHTML = '';
+            for (let i = 0; i < 50; i++) {
+                const bar = document.createElement('div');
+                bar.className = 'wave-bar';
+                bar.style.height = '4px';
+                waveform.appendChild(bar);
+            }
+        }
+
+        // 动画波形
+        function animateWaveform() {
+            const bars = waveform.querySelectorAll('.wave-bar');
+            bars.forEach(bar => {
+                const height = Math.random() * 50 + 10;
+                bar.style.height = height + 'px';
+            });
+            animationId = requestAnimationFrame(animateWaveform);
+        }
+
+        // 开始录音
+        async function startRecording() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        sampleRate: 16000,
+                        channelCount: 1,
+                        echoCancellation: true,
+                        noiseSuppression: true
+                    }
+                });
+
+                audioChunks = [];
+                mediaRecorder = new MediaRecorder(stream, {
+                    mimeType: 'audio/webm'
+                });
+
+                mediaRecorder.ondataavailable = (event) => {
+                    audioChunks.push(event.data);
+                };
+
+                mediaRecorder.onstop = async () => {
+                    if (animationId) {
+                        cancelAnimationFrame(animationId);
+                    }
+                    waveform.style.display = 'none';
+
+                    const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+                    await sendAudio(audioBlob);
+                };
+
+                mediaRecorder.start(100);
+                isRecording = true;
+                recordBtn.textContent = '⏹️ 停止录音';
+                recordBtn.classList.add('recording');
+
+                // 显示波形
+                initWaveform();
+                waveform.style.display = 'flex';
+                animateWaveform();
+
+            } catch (err) {
+                alert('无法访问麦克风: ' + err.message);
+                console.error(err);
+            }
+        }
+
+        // 停止录音
+        function stopRecording() {
+            if (mediaRecorder && isRecording) {
+                mediaRecorder.stop();
+                mediaRecorder.stream.getTracks().forEach(track => track.stop());
+                isRecording = false;
+                recordBtn.textContent = '🎙️ 开始录音';
+                recordBtn.classList.remove('recording');
+            }
+        }
+
+        // 发送音频
+        async function sendAudio(blob) {
+            resultText.textContent = '正在识别...';
+            resultText.classList.remove('empty');
+
+            const formData = new FormData();
+            formData.append('audio', blob, 'recording.webm');
+
+            try {
+                const response = await fetch('/api/recognize', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                const data = await response.json();
+
+                if (data.error) {
+                    resultText.textContent = '错误: ' + data.error;
+                } else if (data.text) {
+                    resultText.textContent = data.text;
+                    resultText.classList.remove('empty');
+                } else {
+                    resultText.textContent = '没有识别到语音';
+                    resultText.classList.add('empty');
+                }
+            } catch (err) {
+                resultText.textContent = '识别失败: ' + err.message;
+            }
+        }
+
+        // 事件监听
+        recordBtn.addEventListener('click', () => {
+            if (isRecording) {
+                stopRecording();
+            } else {
+                startRecording();
+            }
+        });
+
+        // 初始化
+        checkStatus();
+        setInterval(checkStatus, 5000);
+    </script>
+</body>
+</html>

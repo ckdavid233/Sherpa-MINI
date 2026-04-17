@@ -1,0 +1,841 @@
+#!/usr/bin/env python3
+"""
+sherpa-onnx HTTPS WebSocket 实时流式语音识别服务
+使用 SenseVoice 模型，识别效果更好！
+"""
+
+import os
+import sys
+import json
+import threading
+import base64
+import struct
+from pathlib import Path
+from datetime import datetime
+
+try:
+    from flask import Flask, render_template
+    from flask_sock import Sock
+except ImportError:
+    print("请安装: pip install flask flask-sock")
+    sys.exit(1)
+
+try:
+    import sherpa_onnx
+except ImportError:
+    print("sherpa_onnx 未安装")
+    sys.exit(1)
+
+try:
+    import numpy as np
+except ImportError:
+    print("请安装: pip install numpy")
+    sys.exit(1)
+
+
+# 配置
+app = Flask(__name__)
+app.config['SOCK_SERVER_OPTIONS'] = {'ping_interval': 25}
+sock = Sock(app)
+
+# 全局识别器
+recognizer = None
+recognizer_lock = threading.Lock()
+
+
+def init_recognizer():
+    """初始化 ASR 识别器 - 使用 SenseVoice"""
+    global recognizer
+
+    model_dir = Path("/home/tsingwin/apps/sherpa-onnx/models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17")
+
+    model_file = model_dir / "model.int8.onnx"
+    tokens_file = model_dir / "tokens.txt"
+
+    if not all(f.exists() for f in [model_file, tokens_file]):
+        raise ValueError(f"模型文件不存在，请检查: {model_dir}")
+
+    print("正在加载 SenseVoice 模型 (GPU 加速)...")
+    print(f"模型文件: {model_file}")
+
+    recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
+        model=str(model_file),
+        tokens=str(tokens_file),
+        use_itn=True,
+        debug=False,
+        provider="cuda",
+        num_threads=4
+    )
+    print("SenseVoice 模型加载完成！支持：中文/英文/日语/韩语/粤语")
+    return recognizer
+
+
+def decode_pcm_data(data):
+    """解码 Web Audio PCM 数据 (Float32LE)"""
+    try:
+        pcm_data = base64.b64decode(data)
+        samples = np.frombuffer(pcm_data, dtype=np.float32)
+        return samples
+    except Exception as e:
+        print(f"解码 PCM 数据失败: {e}")
+        return None
+
+
+@app.route('/')
+def index():
+    """主页"""
+    return render_template('streaming-sensevoice.html')
+
+
+@app.route('/api/status', methods=['GET'])
+def status():
+    """服务状态"""
+    return json.dumps({
+        "status": "ok",
+        "model_loaded": recognizer is not None,
+        "provider": "cuda" if recognizer else "none",
+        "model_name": "SenseVoice"
+    })
+
+
+@sock.route('/ws/recognize')
+def recognize_audio(ws):
+    """WebSocket 语音识别端点 - SenseVoice 增量流式识别，边说话边出结果"""
+    if recognizer is None:
+        ws.send(json.dumps({"type": "error", "message": "识别器未初始化"}))
+        return
+
+    audio_buffer = []
+    sample_rate = 16000
+    min_samples_for_recognition = int(sample_rate * 1.0)  # 至少1秒才识别
+    last_text = ""
+
+    try:
+        while True:
+            message = ws.receive()
+            if message is None:
+                break
+
+            try:
+                data = json.loads(message)
+            except json.JSONDecodeError:
+                continue
+
+            msg_type = data.get('type')
+
+            if msg_type == 'start':
+                # 开始新的识别会话
+                audio_buffer = []
+                last_text = ""
+                ws.send(json.dumps({"type": "started"}))
+
+            elif msg_type == 'audio':
+                # 累积音频数据
+                pcm_data = data.get('data')
+                samples = decode_pcm_data(pcm_data)
+                if samples is not None:
+                    audio_buffer.extend(samples.tolist())
+
+                    # 达到最小长度，进行增量识别
+                    if len(audio_buffer) >= min_samples_for_recognition:
+                        audio = np.array(audio_buffer, dtype=np.float32)
+
+                        with recognizer_lock:
+                            stream = recognizer.create_stream()
+                            stream.accept_waveform(sample_rate, audio)
+                            recognizer.decode_stream(stream)
+                            current_text = stream.result.text
+
+                        # 只有结果变化时才发送
+                        if current_text != last_text:
+                            last_text = current_text
+                            ws.send(json.dumps({
+                                "type": "result",
+                                "text": current_text,
+                                "partial": True
+                            }))
+
+            elif msg_type == 'stop':
+                # 完成录音，最终识别
+                if len(audio_buffer) == 0:
+                    ws.send(json.dumps({
+                        "type": "result",
+                        "text": "",
+                        "final": True
+                    }))
+                    continue
+
+                # 合并音频数据
+                audio = np.array(audio_buffer, dtype=np.float32)
+
+                # 最终识别
+                with recognizer_lock:
+                    stream = recognizer.create_stream()
+                    stream.accept_waveform(sample_rate, audio)
+                    recognizer.decode_stream(stream)
+                    result = stream.result.text
+
+                # 发送最终结果
+                ws.send(json.dumps({
+                    "type": "result",
+                    "text": result,
+                    "final": True,
+                    "duration_seconds": len(audio_buffer) / sample_rate
+                }))
+
+                audio_buffer = []
+                last_text = ""
+
+            elif msg_type == 'ping':
+                ws.send(json.dumps({"type": "pong"}))
+
+    except Exception as e:
+        print(f"WebSocket 错误: {e}")
+        import traceback
+        traceback.print_exc()
+        try:
+            ws.send(json.dumps({"type": "error", "message": str(e)}))
+        except:
+            pass
+
+
+def get_server_address():
+    """获取服务器地址"""
+    import socket
+    hostname = socket.gethostname()
+    try:
+        local_ip = socket.gethostbyname(hostname)
+    except:
+        local_ip = "127.0.0.1"
+    return local_ip
+
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="sherpa-onnx HTTPS SenseVoice ASR 服务")
+    parser.add_argument("--host", type=str, default="0.0.0.0", help="监听地址")
+    parser.add_argument("--port", type=int, default=6008, help="监听端口")
+    parser.add_argument("--cert", type=str, default="cert.pem", help="证书文件")
+    parser.add_argument("--no-ssl", action="store_true", help="不使用 HTTPS")
+    parser.add_argument("--fp16", action="store_true", help="使用FP16模型，更大更准确")
+
+    args = parser.parse_args()
+
+    # 初始化识别器
+    try:
+        init_recognizer()
+    except Exception as e:
+        print(f"初始化识别器失败: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+    # 创建 templates 目录
+    templates_dir = Path("templates")
+    templates_dir.mkdir(exist_ok=True)
+
+    # 生成 HTML
+    index_html = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>sherpa-onnx SenseVoice 语音识别</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .container {
+            background: white;
+            border-radius: 24px;
+            box-shadow: 0 25px 80px rgba(0,0,0,0.4);
+            max-width: 800px;
+            width: 100%;
+            padding: 45px;
+        }
+        h1 {
+            color: #1a1a2e;
+            text-align: center;
+            margin-bottom: 10px;
+            font-size: 30px;
+            font-weight: 700;
+        }
+        .subtitle {
+            text-align: center;
+            color: #6b7280;
+            margin-bottom: 35px;
+            font-size: 16px;
+        }
+        .model-badge {
+            text-align: center;
+            margin-bottom: 20px;
+        }
+        .model-badge span {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+            color: white;
+            padding: 6px 16px;
+            border-radius: 20px;
+            font-size: 14px;
+            font-weight: 600;
+        }
+        .status-bar {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            background: #f8fafc;
+            padding: 16px 20px;
+            border-radius: 14px;
+            margin-bottom: 25px;
+        }
+        .status-dot {
+            width: 14px;
+            height: 14px;
+            border-radius: 50%;
+            background: #9ca3af;
+            transition: all 0.3s;
+        }
+        .status-dot.connected {
+            background: #10b981;
+            animation: pulse 2s infinite;
+        }
+        .status-dot.recording {
+            background: #ef4444;
+            animation: pulse-red 0.5s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.6; transform: scale(1.1); }
+        }
+        @keyframes pulse-red {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+        .status-text {
+            color: #4b5563;
+            font-weight: 500;
+            flex: 1;
+        }
+        .controls {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 30px;
+        }
+        .btn {
+            flex: 1;
+            padding: 18px 24px;
+            font-size: 18px;
+            font-weight: 600;
+            border: none;
+            border-radius: 14px;
+            cursor: pointer;
+            transition: all 0.3s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+        }
+        .btn-primary {
+            background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+            color: white;
+        }
+        .btn-primary:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 12px 28px rgba(16, 185, 129, 0.35);
+        }
+        .btn-danger {
+            background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
+            color: white;
+        }
+        .btn-danger:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 12px 28px rgba(239, 68, 68, 0.35);
+        }
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .result-container {
+            background: #0f172a;
+            border-radius: 18px;
+            padding: 28px;
+            min-height: 180px;
+            position: relative;
+        }
+        .result-label {
+            color: #94a3b8;
+            font-size: 13px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 12px;
+        }
+        .result-text {
+            color: #f1f5f9;
+            font-size: 22px;
+            line-height: 1.7;
+            word-wrap: break-word;
+            font-family: 'SF Mono', 'Fira Code', monospace;
+        }
+        .result-text.empty {
+            color: #475569;
+            font-style: italic;
+        }
+        .processing {
+            color: #fbbf24 !important;
+        }
+        .waveform {
+            margin-top: 25px;
+            height: 80px;
+            background: #f1f5f9;
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 5px;
+            padding: 15px;
+        }
+        .wave-bar {
+            width: 5px;
+            background: linear-gradient(135deg, #8b5cf6 0%, #6366f1 100%);
+            border-radius: 3px;
+            transition: height 0.08s;
+        }
+        .languages {
+            margin-top: 20px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            justify-content: center;
+        }
+        .lang-tag {
+            background: #f3f4f6;
+            color: #374151;
+            padding: 6px 14px;
+            border-radius: 20px;
+            font-size: 13px;
+            font-weight: 500;
+        }
+        .info-box {
+            margin-top: 25px;
+            padding: 18px 22px;
+            background: #dbeafe;
+            border-radius: 12px;
+            border-left: 4px solid #3b82f6;
+        }
+        .info-box p {
+            color: #1e40af;
+            font-size: 14px;
+            line-height: 1.6;
+        }
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 15px;
+            margin-top: 25px;
+        }
+        .stat-card {
+            background: #f8fafc;
+            padding: 18px;
+            border-radius: 12px;
+            text-align: center;
+        }
+        .stat-value {
+            font-size: 28px;
+            font-weight: 700;
+            color: #1e293b;
+        }
+        .stat-label {
+            font-size: 13px;
+            color: #64748b;
+            margin-top: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎤 语音识别</h1>
+        <p class="subtitle">基于 sherpa-onnx + SenseVoice · GPU 加速</p>
+
+        <div class="model-badge">
+            <span>✓ SenseVoice 模型 ✓ 支持多语言</span>
+        </div>
+
+        <div class="languages">
+            <span class="lang-tag">中文</span>
+            <span class="lang-tag">English</span>
+            <span class="lang-tag">日本語</span>
+            <span class="lang-tag">한국어</span>
+            <span class="lang-tag">粤语</span>
+        </div>
+
+        <div class="status-bar" style="margin-top: 25px;">
+            <div class="status-dot" id="statusDot"></div>
+            <span class="status-text" id="statusText">正在连接...</span>
+        </div>
+
+        <div class="controls">
+            <button class="btn btn-primary" id="startBtn" disabled>
+                🎙️ 开始录音
+            </button>
+            <button class="btn btn-danger" id="stopBtn" disabled>
+                ⏹️ 识别完成
+            </button>
+        </div>
+
+        <div class="waveform" id="waveform"></div>
+
+        <div class="stats" id="stats" style="display: none;">
+            <div class="stat-card">
+                <div class="stat-value" id="audioLength">0s</div>
+                <div class="stat-label">音频时长</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="processTime">0ms</div>
+                <div class="stat-label">识别耗时</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="isRecording">否</div>
+                <div class="stat-label">录音状态</div>
+            </div>
+        </div>
+
+        <div class="result-container" style="margin-top: 25px;">
+            <div class="result-label">识别结果</div>
+            <div class="result-text empty" id="resultText">点击"开始录音"开始说话...</div>
+        </div>
+
+        <div class="info-box">
+            <p><strong>特点：</strong>SenseVoice 是 FunAudioLLM 出品的最新多语言语音识别模型，在口音、方言、数字识别上效果更好。支持中文、英文、日语、韩语、粤语五种语言。</p>
+        </div>
+    </div>
+
+    <script>
+        let ws = null;
+        let mediaStream = null;
+        let audioContext = null;
+        let processor = null;
+        let sourceNode = null;
+        let isRecording = false;
+        let chunkCount = 0;
+        let startTime = 0;
+
+        const statusDot = document.getElementById('statusDot');
+        const statusText = document.getElementById('statusText');
+        const startBtn = document.getElementById('startBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const resultText = document.getElementById('resultText');
+        const waveform = document.getElementById('waveform');
+        const stats = document.getElementById('stats');
+        const audioLengthEl = document.getElementById('audioLength');
+        const processTimeEl = document.getElementById('processTime');
+        const isRecordingEl = document.getElementById('isRecording');
+
+        // 初始化波形条
+        function initWaveform() {
+            waveform.innerHTML = '';
+            for (let i = 0; i < 60; i++) {
+                const bar = document.createElement('div');
+                bar.className = 'wave-bar';
+                bar.style.height = '8px';
+                waveform.appendChild(bar);
+            }
+        }
+        initWaveform();
+
+        // 连接 WebSocket
+        function connect() {
+            const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${location.host}/ws/recognize`;
+
+            statusText.textContent = '正在连接...';
+            statusDot.className = 'status-dot';
+
+            ws = new WebSocket(wsUrl);
+
+            ws.onopen = () => {
+                statusText.textContent = '已连接 - SenseVoice 就绪';
+                statusDot.className = 'status-dot connected';
+                startBtn.disabled = false;
+            };
+
+            ws.onclose = () => {
+                statusText.textContent = '连接断开';
+                statusDot.className = 'status-dot';
+                startBtn.disabled = true;
+                stopBtn.disabled = true;
+                if (isRecording) {
+                    stopRecording();
+                }
+                setTimeout(connect, 3000);
+            };
+
+            ws.onerror = (err) => {
+                console.error('WebSocket 错误:', err);
+            };
+
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                handleMessage(data);
+            };
+        }
+
+        function handleMessage(data) {
+            switch (data.type) {
+                case 'started':
+                    resultText.textContent = '';
+                    resultText.classList.remove('empty');
+                    resultText.classList.remove('processing');
+                    stats.style.display = 'grid';
+                    chunkCount = 0;
+                    break;
+
+                case 'processing':
+                    resultText.textContent = '正在处理音频...';
+                    resultText.classList.add('processing');
+                    break;
+
+                case 'result':
+                    if (data.text) {
+                        resultText.textContent = data.text;
+                        resultText.classList.remove('empty');
+                        if (data.partial) {
+                            resultText.style.opacity = '0.8';
+                        } else {
+                            resultText.style.opacity = '1';
+                        }
+                    } else {
+                        resultText.textContent = '识别中...';
+                        resultText.classList.add('empty');
+                    }
+                    resultText.classList.remove('processing');
+                    if (data.duration_seconds && processTimeEl) {
+                        const elapsed = Date.now() - startTime;
+                        processTimeEl.textContent = elapsed + 'ms';
+                        audioLengthEl.textContent = data.duration_seconds.toFixed(1) + 's';
+                    }
+                    break;
+
+                case 'error':
+                    resultText.textContent = '错误: ' + data.message;
+                    resultText.classList.add('empty');
+                    break;
+
+                case 'pong':
+                    break;
+            }
+        }
+
+        async function startRecording() {
+            try {
+                mediaStream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        sampleRate: 16000,
+                        channelCount: 1,
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true
+                    }
+                });
+
+                audioContext = new AudioContext({ sampleRate: 16000 });
+                sourceNode = audioContext.createMediaStreamSource(mediaStream);
+
+                // 创建 ScriptProcessorNode 处理音频
+                const bufferSize = 4096;
+                processor = audioContext.createScriptProcessor(bufferSize, 1, 1);
+
+                processor.onaudioprocess = (e) => {
+                    if (!isRecording) return;
+
+                    const inputData = e.inputBuffer.getChannelData(0);
+                    sendAudioData(inputData);
+                    updateWaveform(inputData);
+                    chunkCount++;
+                };
+
+                sourceNode.connect(processor);
+                processor.connect(audioContext.destination);
+
+                // 开始识别会话
+                ws.send(JSON.stringify({ type: 'start' }));
+                isRecording = true;
+                startTime = Date.now();
+
+                startBtn.disabled = true;
+                stopBtn.disabled = false;
+                statusDot.className = 'status-dot recording';
+                statusText.textContent = '正在录音...';
+                isRecordingEl.textContent = '是';
+                audioLengthEl.textContent = '0s';
+                processTimeEl.textContent = '0ms';
+
+            } catch (err) {
+                alert('无法访问麦克风: ' + err.message);
+                console.error(err);
+            }
+        }
+
+        function sendAudioData(audioData) {
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+            const float32Array = new Float32Array(audioData);
+            const bytes = new Uint8Array(float32Array.buffer);
+            let binary = '';
+            for (let i = 0; i < bytes.byteLength; i++) {
+                binary += String.fromCharCode(bytes[i]);
+            }
+            const base64 = btoa(binary);
+
+            ws.send(JSON.stringify({
+                type: 'audio',
+                data: base64
+            }));
+        }
+
+        function updateWaveform(audioData) {
+            const bars = waveform.querySelectorAll('.wave-bar');
+            const step = Math.floor(audioData.length / bars.length);
+
+            bars.forEach((bar, i) => {
+                let sum = 0;
+                for (let j = 0; j < step; j++) {
+                    const idx = i * step + j;
+                    if (idx < audioData.length) {
+                        sum += Math.abs(audioData[idx]);
+                    }
+                }
+                const avg = sum / step;
+                const height = Math.max(8, avg * 200);
+                bar.style.height = height + 'px';
+            });
+        }
+
+        function stopRecording() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'stop' }));
+            }
+
+            if (processor) {
+                processor.disconnect();
+                processor = null;
+            }
+            if (sourceNode) {
+                sourceNode.disconnect();
+                sourceNode = null;
+            }
+            if (audioContext) {
+                audioContext.close();
+                audioContext = null;
+            }
+            if (mediaStream) {
+                mediaStream.getTracks().forEach(track => track.stop());
+                mediaStream = null;
+            }
+
+            isRecording = false;
+            startBtn.disabled = false;
+            stopBtn.disabled = true;
+            statusDot.className = 'status-dot connected';
+            statusText.textContent = '已连接 - 等待识别';
+            isRecordingEl.textContent = '否';
+
+            // 重置波形
+            const bars = waveform.querySelectorAll('.wave-bar');
+            bars.forEach(bar => bar.style.height = '8px');
+        }
+
+        // 事件监听
+        startBtn.addEventListener('click', startRecording);
+        stopBtn.addEventListener('click', stopRecording);
+
+        // 初始化连接
+        connect();
+
+        // 保活
+        setInterval(() => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'ping' }));
+            }
+        }, 20000);
+    </script>
+</body>
+</html>"""
+
+    with open(templates_dir / "streaming-sensevoice.html", "w") as f:
+        f.write(index_html)
+
+    # 生成证书（如果需要）
+    if not args.no_ssl and not Path(args.cert).exists():
+        print(f"证书文件 {args.cert} 不存在，正在生成...")
+        try:
+            from OpenSSL import crypto
+
+            k = crypto.PKey()
+            k.generate_key(crypto.TYPE_RSA, 4096)
+
+            cert = crypto.X509()
+            cert.get_subject().C = "CN"
+            cert.get_subject().ST = "sherpa"
+            cert.get_subject().L = "sherpa"
+            cert.get_subject().O = "sherpa"
+            cert.get_subject().OU = "sherpa"
+            cert.get_subject().CN = "sherpa-onnx-sensevoice"
+            cert.set_serial_number(3000)
+            cert.gmtime_adj_notBefore(0)
+            cert.gmtime_adj_notAfter(10 * 365 * 24 * 60 * 60)
+            cert.set_issuer(cert.get_subject())
+            cert.set_pubkey(k)
+            cert.sign(k, "sha512")
+
+            with open(args.cert, "wt") as f:
+                f.write(crypto.dump_privatekey(crypto.FILETYPE_PEM, k).decode("utf-8"))
+                f.write(crypto.dump_certificate(crypto.FILETYPE_PEM, cert).decode("utf-8"))
+            print(f"证书已生成: {args.cert}")
+        except ImportError:
+            print("请安装 pyopenssl: pip install pyopenssl")
+            sys.exit(1)
+
+    # 显示访问地址
+    server_ip = get_server_address()
+    print("\n" + "=" * 70)
+    print("  sherpa-onnx HTTPS SenseVoice ASR 服务已启动")
+    print("=" * 70)
+    print(f"\nModel: SenseVoice (INT8)")
+    print(f"Supported languages: 中文/英文/日语/韩语/粤语")
+    print(f"\n请在浏览器中访问以下地址之一:")
+    protocol = "http" if args.no_ssl else "https"
+    print(f"  - 本机: {protocol}://localhost:{args.port}")
+    print(f"  - 局域网: {protocol}://{server_ip}:{args.port}")
+    print(f"\n功能特点:")
+    print(f"  ✅ SenseVoice 模型 - 更高识别准确率")
+    print(f"  ✅ GPU 加速 (CUDA)")
+    print(f"  ✅ 支持五种语言")
+    print(f"  ✅ 实时波形显示")
+    print(f"\n使用方法:")
+    print(f"  1. 点击'开始录音'")
+    print(f"  2. 说话")
+    print(f"  3. 点击'识别完成'获取结果")
+    print("\n按 Ctrl+C 停止服务\n")
+
+    # 启动服务
+    ssl_context = None
+    if not args.no_ssl:
+        ssl_context = (args.cert, args.cert)
+
+    app.run(host=args.host, port=args.port, ssl_context=ssl_context, debug=False, threaded=True)
+
+
+if __name__ == "__main__":
+    main()
