@@ -4,6 +4,9 @@ sherpa-onnx HTTPS VAD + SenseVoice 分段识别
 VAD 检测停顿切分句子，每句送 SenseVoice 识别，准确率高又不卡
 """
 
+from __future__ import annotations
+
+import errno
 import os
 import sys
 import json
@@ -44,16 +47,20 @@ recognizer = None
 vad_window_size = 0
 model_lock = threading.Lock()
 
+# 模型路径相对本脚本所在目录，避免机器/目录结构不同导致硬编码失效
+_REPO_ROOT = Path(__file__).resolve().parent
+_MODELS_DIR = _REPO_ROOT / "models"
 
 TERMINAL_PUNCTUATION = "。！？!?."
 PAUSE_PUNCTUATION = "，、,；;：:"
 # 运行时可由 main() 根据命令行参数覆盖
 MIN_SEGMENT_SECONDS = 0.03
-SEGMENT_CONTEXT_SECONDS = 0.18
-PRE_SPEECH_CONTEXT_SECONDS = 0.22
+SEGMENT_CONTEXT_SECONDS = 0.30
+PRE_SPEECH_CONTEXT_SECONDS = 0.34
 PARTIAL_DECODE_INTERVAL_SECONDS = 0.40
 PARTIAL_MAX_SECONDS = 5.0
 PREROLL_OVERLAP_SEARCH_SECONDS = 0.25
+PARTIAL_ENABLED = True
 
 
 def _best_suffix_prefix_overlap(preroll: np.ndarray, segment: np.ndarray, max_overlap_samples: int) -> int:
@@ -116,11 +123,12 @@ def init_vad(
     min_silence_duration: float,
     min_speech_duration: float,
     max_speech_duration: float,
+    vad_neg_threshold: float | None = None,
 ):
     """初始化 VAD 语音活动检测"""
     global vad, vad_window_size
 
-    model_path = Path("/home/tsingwin/apps/sherpa-onnx/models/silero_vad.onnx")
+    model_path = _MODELS_DIR / "silero_vad.onnx"
     if not model_path.exists():
         raise ValueError(f"VAD 模型不存在: {model_path}\n请先下载 silero_vad.onnx 放到 models 目录")
 
@@ -140,6 +148,10 @@ def init_vad(
         min_speech_duration=min_speech_duration,
         max_speech_duration=max_speech_duration,
     )
+    # 新版 Python 绑定可写；略抬高 neg_threshold 可收窄滞回，句尾在底噪下更易“收束”（默认 -1 由 C++ 用 threshold-0.15）
+    if vad_neg_threshold is not None and hasattr(silero_config, "neg_threshold"):
+        silero_config.neg_threshold = float(vad_neg_threshold)
+        print(f"Silero VAD neg_threshold={vad_neg_threshold}（自定义退出滞回）")
 
     vad_config = sherpa_onnx.VadModelConfig(
         silero_vad=silero_config,
@@ -162,12 +174,21 @@ def init_recognizer():
     """初始化 SenseVoice 识别器"""
     global recognizer
 
-    model_dir = Path("/home/tsingwin/apps/sherpa-onnx/models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17")
-
-    model_file = model_dir / "model.int8.onnx"
+    model_dir = _MODELS_DIR / "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
     tokens_file = model_dir / "tokens.txt"
+    fp32 = model_dir / "model.onnx"
+    int8 = model_dir / "model.int8.onnx"
+    # 全精度通常更稳；仅有 int8 时自动回退
+    if fp32.is_file():
+        model_file = fp32
+        print("SenseVoice: 使用 model.onnx（全精度）")
+    elif int8.is_file():
+        model_file = int8
+        print("SenseVoice: 使用 model.int8.onnx（量化）")
+    else:
+        model_file = int8
 
-    if not all(f.exists() for f in [model_file, tokens_file]):
+    if not model_file.exists() or not tokens_file.exists():
         raise ValueError(f"模型文件不存在，请检查: {model_dir}")
 
     print("正在加载 SenseVoice 模型 (GPU 加速)...")
@@ -182,6 +203,48 @@ def init_recognizer():
     )
     print("SenseVoice 模型加载完成！支持：中文/英文/日语/韩语/粤语")
     return recognizer
+
+
+def _decode_sense_voice_once(sample_rate: int, waveform: np.ndarray) -> str:
+    """对单段波形做一次 SenseVoice 解码（调用方已持 model_lock）。"""
+    stream = recognizer.create_stream()
+    stream.accept_waveform(sample_rate, waveform.astype(np.float32, copy=False))
+    recognizer.decode_stream(stream)
+    return normalize_recognition_text(stream.result.text)
+
+
+def decode_sense_voice_segment(sample_rate: int, enhanced: np.ndarray, raw: np.ndarray) -> str:
+    """
+    解码 VAD 分段；多路重试减轻「空识别→整段被跳过」的吞句现象。
+    调用方须已持有 model_lock。
+    """
+    raw_f = raw.astype(np.float32, copy=False)
+
+    for w in (enhanced, raw_f):
+        text = _decode_sense_voice_once(sample_rate, w)
+        if text:
+            return text
+
+    if raw_f.size == 0:
+        return ""
+
+    pad_r = int(0.18 * sample_rate)
+    padded_r = np.pad(np.array(raw_f, copy=True), (0, pad_r), mode="constant", constant_values=0.0)
+    text = _decode_sense_voice_once(sample_rate, padded_r)
+    if text:
+        return text
+
+    pad_l = int(0.08 * sample_rate)
+    pad_r2 = int(0.12 * sample_rate)
+    padded_lr = np.pad(np.array(raw_f, copy=True), (pad_l, pad_r2), mode="constant", constant_values=0.0)
+    text = _decode_sense_voice_once(sample_rate, padded_lr)
+    if text:
+        return text
+
+    # 极轻音量尾音时偶发全空：略提升幅度再试（限幅避免爆音）
+    boosted = np.clip(np.array(raw_f, copy=True) * 1.75, -1.0, 1.0)
+    text = _decode_sense_voice_once(sample_rate, boosted)
+    return text
 
 
 def decode_pcm_data(data):
@@ -316,23 +379,22 @@ def vad_asr(ws):
                     segments_to_decode = []
                     speech_detected = False
 
-                    # 按 VAD 期望的 window_size 分帧送入，和官方示例保持一致
+                    # 按 VAD 期望的 window_size 分帧送入；pending 的“新句 rolling”须在 pop 之后更新，
+                    # 否则同一块音频里刚结束的旧段会误用新句开头的上下文作 preroll。
                     with model_lock:
                         while len(buffer) >= vad_window_size:
                             vad.accept_waveform(buffer[:vad_window_size])
                             buffer = buffer[vad_window_size:]
 
                         speech_detected = vad.is_speech_detected()
-                        if speech_detected and not speech_active:
-                            pending_segment_preroll = rolling_audio_tail.copy()
-                        speech_active = speech_detected
-
                         while not vad.empty():
                             segment = vad.front
                             vad.pop()
                             segments_to_decode.append(np.array(segment.samples, dtype=np.float32))
 
-                    if speech_detected:
+                    speech_just_started = speech_detected and not speech_active
+
+                    if speech_detected and PARTIAL_ENABLED:
                         now = time.time()
                         enough_audio = len(live_buffer) >= int(0.6 * sample_rate)
                         should_decode_partial = now - last_partial_decode_time >= PARTIAL_DECODE_INTERVAL_SECONDS
@@ -360,27 +422,23 @@ def vad_asr(ws):
                         # 没检测到语音时，只保留少量上下文，避免缓冲区无限增长
                         live_buffer = live_buffer[-max_live_buffer_samples:]
 
+                    # 同一次 VAD 弹出多段时，除首段外须带上一段尾部作上下文，否则易丢句首/丢短句
+                    preroll_carry = (
+                        pending_segment_preroll.copy()
+                        if pending_segment_preroll.size
+                        else np.array([], dtype=np.float32)
+                    )
                     for segment_audio in segments_to_decode:
                         if len(segment_audio) < int(MIN_SEGMENT_SECONDS * sample_rate):
                             continue
 
-                        preroll = pending_segment_preroll
-                        pending_segment_preroll = np.array([], dtype=np.float32)
                         raw_segment = np.array(segment_audio, dtype=np.float32, copy=False)
-                        enhanced_segment = attach_preroll_and_pad(raw_segment, preroll, sample_rate)
+                        enhanced_segment = attach_preroll_and_pad(raw_segment, preroll_carry, sample_rate)
 
                         with model_lock:
-                            stream = recognizer.create_stream()
-                            stream.accept_waveform(sample_rate, enhanced_segment)
-                            recognizer.decode_stream(stream)
-                            text = normalize_recognition_text(stream.result.text)
-
-                            if not text:
-                                # 增强链路偶发会把音频形态弄坏导致空识别：回退到 VAD 原始分段再试一次
-                                stream = recognizer.create_stream()
-                                stream.accept_waveform(sample_rate, raw_segment)
-                                recognizer.decode_stream(stream)
-                                text = normalize_recognition_text(stream.result.text)
+                            text = decode_sense_voice_segment(
+                                sample_rate, enhanced_segment, raw_segment
+                            )
 
                         if not text:
                             continue
@@ -396,9 +454,20 @@ def vad_asr(ws):
                         }))
 
                         live_buffer = np.array([], dtype=np.float32)
-                        speech_active = False
                         last_partial_text = ""
                         last_partial_decode_time = 0.0
+
+                        tail_n = int(max(PRE_SPEECH_CONTEXT_SECONDS, 0.15) * sample_rate)
+                        if raw_segment.size > 0:
+                            preroll_carry = raw_segment[-min(tail_n, raw_segment.size) :].copy()
+                        else:
+                            preroll_carry = np.array([], dtype=np.float32)
+
+                    if speech_just_started:
+                        pending_segment_preroll = rolling_audio_tail.copy()
+                    else:
+                        pending_segment_preroll = preroll_carry
+                    speech_active = speech_detected
 
             elif msg_type == 'stop':
                 # 停止录音，处理剩余语音
@@ -414,27 +483,22 @@ def vad_asr(ws):
                         vad.pop()
                         segments_to_decode.append(np.array(segment.samples, dtype=np.float32))
 
+                preroll_carry = (
+                    pending_segment_preroll.copy()
+                    if pending_segment_preroll.size
+                    else np.array([], dtype=np.float32)
+                )
                 for segment_audio in segments_to_decode:
                     if len(segment_audio) < int(MIN_SEGMENT_SECONDS * sample_rate):
-                        # 太短，跳过
                         continue
 
-                    preroll = pending_segment_preroll
-                    pending_segment_preroll = np.array([], dtype=np.float32)
                     raw_segment = np.array(segment_audio, dtype=np.float32, copy=False)
-                    enhanced_segment = attach_preroll_and_pad(raw_segment, preroll, sample_rate)
+                    enhanced_segment = attach_preroll_and_pad(raw_segment, preroll_carry, sample_rate)
 
                     with model_lock:
-                        stream = recognizer.create_stream()
-                        stream.accept_waveform(sample_rate, enhanced_segment)
-                        recognizer.decode_stream(stream)
-                        text = normalize_recognition_text(stream.result.text)
-
-                        if not text:
-                            stream = recognizer.create_stream()
-                            stream.accept_waveform(sample_rate, raw_segment)
-                            recognizer.decode_stream(stream)
-                            text = normalize_recognition_text(stream.result.text)
+                        text = decode_sense_voice_segment(
+                            sample_rate, enhanced_segment, raw_segment
+                        )
 
                     if not text:
                         continue
@@ -442,6 +506,14 @@ def vad_asr(ws):
                     full_result = merge_segment_text(full_result, text, is_final=True)
 
                     last_segment_count += 1
+
+                    tail_n = int(max(PRE_SPEECH_CONTEXT_SECONDS, 0.15) * sample_rate)
+                    if raw_segment.size > 0:
+                        preroll_carry = raw_segment[-min(tail_n, raw_segment.size) :].copy()
+                    else:
+                        preroll_carry = np.array([], dtype=np.float32)
+
+                pending_segment_preroll = preroll_carry
 
                 # 发送最终结果
                 ws.send(json.dumps({
@@ -495,26 +567,37 @@ def main():
     parser.add_argument(
         "--vad-threshold",
         type=float,
-        default=0.35,
-        help="Silero VAD 阈值，越大越不容易误触发语音",
+        default=0.38,
+        help="Silero VAD 语音概率阈值；过高易把句尾当静音(吞字)，过低底噪易拖着不断句",
     )
     parser.add_argument(
         "--vad-min-silence",
         type=float,
-        default=0.20,
-        help="判定为停顿的最短静音时长（秒），越大越不容易切碎句",
+        default=0.22,
+        help="判定为一句结束的最短静音(秒)；过小句内短停顿也会切段→短段空识别易吞句，略大更整句",
     )
     parser.add_argument(
         "--vad-min-speech",
         type=float,
-        default=0.12,
-        help="最短语音时长（秒），越大越不容易把短噪声当语音",
+        default=0.10,
+        help="判为「开始说话」前至少多长语音(秒)；过大易吃掉句首短音，过小易把噪声当头",
     )
     parser.add_argument(
         "--vad-max-speech",
         type=float,
         default=12.0,
         help="单段最长语音（秒），超过后 VAD 内部会提高阈值分段",
+    )
+    parser.add_argument(
+        "--vad-neg-threshold",
+        type=float,
+        default=None,
+        help="Silero 退出滞回阈值(需 sherpa_onnx 暴露 neg_threshold)；如 0.38 配合 threshold=0.45，句尾在杂音下更易断",
+    )
+    parser.add_argument(
+        "--no-partial",
+        action="store_true",
+        help="关闭实时 partial 解码，仅输出 VAD 定稿分句，减轻“预览与定稿不一致”的错觉",
     )
     parser.add_argument(
         "--min-segment-seconds",
@@ -525,14 +608,14 @@ def main():
     parser.add_argument(
         "--segment-context-seconds",
         type=float,
-        default=0.18,
-        help="分段识别时在尾部补的上下文（秒），减轻截断",
+        default=0.30,
+        help="分段识别时在尾部补的上下文（秒），减轻截断与吞尾",
     )
     parser.add_argument(
         "--pre-speech-context-seconds",
         type=float,
-        default=0.22,
-        help="检测到语音开始时保留的前置上下文（秒），减轻句首丢字",
+        default=0.34,
+        help="语音段开始前保留的前置上下文（秒），减轻句首被吃",
     )
     parser.add_argument(
         "--partial-interval",
@@ -556,13 +639,14 @@ def main():
     args = parser.parse_args()
 
     global MIN_SEGMENT_SECONDS, SEGMENT_CONTEXT_SECONDS, PRE_SPEECH_CONTEXT_SECONDS, PARTIAL_DECODE_INTERVAL_SECONDS
-    global PARTIAL_MAX_SECONDS, PREROLL_OVERLAP_SEARCH_SECONDS
+    global PARTIAL_MAX_SECONDS, PREROLL_OVERLAP_SEARCH_SECONDS, PARTIAL_ENABLED
     MIN_SEGMENT_SECONDS = args.min_segment_seconds
     SEGMENT_CONTEXT_SECONDS = args.segment_context_seconds
     PRE_SPEECH_CONTEXT_SECONDS = args.pre_speech_context_seconds
     PARTIAL_DECODE_INTERVAL_SECONDS = args.partial_interval
     PARTIAL_MAX_SECONDS = args.partial_max_seconds
     PREROLL_OVERLAP_SEARCH_SECONDS = args.preroll_overlap_search_seconds
+    PARTIAL_ENABLED = not args.no_partial
 
     # 初始化模型
     try:
@@ -571,6 +655,7 @@ def main():
             min_silence_duration=args.vad_min_silence,
             min_speech_duration=args.vad_min_speech,
             max_speech_duration=args.vad_max_speech,
+            vad_neg_threshold=args.vad_neg_threshold,
         )
         init_recognizer()
     except Exception as e:
@@ -1080,13 +1165,14 @@ def main():
 
         async function startRecording() {
             try {
+                // 开启浏览器噪声抑制/回声消除：关闭时环境底噪易被 Silero 判为“持续在说话”，句尾无法断句
                 mediaStream = await navigator.mediaDevices.getUserMedia({
                     audio: {
                         sampleRate: 16000,
                         channelCount: 1,
-                        echoCancellation: false,
-                        noiseSuppression: false,
-                        autoGainControl: false
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true
                     }
                 });
 
@@ -1282,7 +1368,19 @@ def main():
         ssl_context = (args.cert, args.cert)
 
     print(f"* Listening on {args.host}:{args.port}")
-    run_simple(args.host, args.port, app, threaded=True, ssl_context=ssl_context)
+    try:
+        run_simple(args.host, args.port, app, threaded=True, ssl_context=ssl_context)
+    except OSError as e:
+        if e.errno in (errno.EADDRINUSE, getattr(errno, "WSAEADDRINUSE", -1)):
+            print(
+                "\n端口已被占用 (EADDRINUSE)。常见原因:\n"
+                "  1) Cursor/VS Code「端口转发」仍把本机 TCP 6010 留给 ssh/sshd 进程显示为占用——"
+                "在 IDE 的 Ports 面板里删掉旧转发，或断开重连 SSH 后再启动。\n"
+                "  2) 上次 python 未退出（较少发生在整机重启后）；可用: "
+                f"sudo ss -tlnp 'sport = :{args.port}' 或 sudo lsof -iTCP:{args.port} -sTCP:LISTEN 查看进程。\n"
+                "  3) 开发时可在启动脚本里设 FREE_PORT=1 尝试释放端口（会 kill 占用该端口的进程，慎用）。\n"
+            )
+        raise
 
 
 if __name__ == "__main__":

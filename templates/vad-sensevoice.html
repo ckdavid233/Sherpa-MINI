@@ -494,13 +494,14 @@
 
         async function startRecording() {
             try {
+                // 开启浏览器噪声抑制/回声消除：关闭时环境底噪易被 Silero 判为“持续在说话”，句尾无法断句
                 mediaStream = await navigator.mediaDevices.getUserMedia({
                     audio: {
                         sampleRate: 16000,
                         channelCount: 1,
-                        echoCancellation: false,
-                        noiseSuppression: false,
-                        autoGainControl: false
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true
                     }
                 });
 
