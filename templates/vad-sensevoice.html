@@ -3,295 +3,274 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>sherpa-onnx VAD + SenseVoice 智能分段识别</title>
+    <title>语音速记台</title>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        :root {
+            --bg-1: #040612;
+            --bg-2: #0c1536;
+            --card-bg: rgba(13, 19, 45, 0.75);
+            --card-border: rgba(149, 168, 255, 0.22);
+            --text-main: #eaf0ff;
+            --text-sub: #93a1c6;
+            --accent: #6d8bff;
+            --accent-2: #53e1d2;
+            --danger: #ff4f88;
         }
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: linear-gradient(135deg, #8b5cf6 0%, #6366f1 100%);
+            font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            color: var(--text-main);
             min-height: 100vh;
             display: flex;
             align-items: center;
             justify-content: center;
-            padding: 20px;
+            padding: 28px;
+            background:
+                radial-gradient(circle at 20% 20%, rgba(112, 92, 255, 0.32), transparent 38%),
+                radial-gradient(circle at 80% 15%, rgba(55, 201, 255, 0.24), transparent 36%),
+                radial-gradient(circle at 70% 85%, rgba(54, 255, 171, 0.12), transparent 40%),
+                linear-gradient(145deg, var(--bg-1), var(--bg-2));
         }
-        .container {
-            background: white;
-            border-radius: 24px;
-            box-shadow: 0 25px 80px rgba(0,0,0,0.4);
-            max-width: 800px;
-            width: 100%;
-            padding: 45px;
+        .shell {
+            width: min(980px, 100%);
+            border-radius: 28px;
+            border: 1px solid var(--card-border);
+            background: linear-gradient(180deg, rgba(20, 31, 72, 0.78), rgba(8, 12, 29, 0.92));
+            box-shadow: 0 22px 70px rgba(0, 0, 0, 0.52), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+            overflow: hidden;
+            backdrop-filter: blur(8px);
         }
-        h1 {
-            color: #1e1b4b;
-            text-align: center;
-            margin-bottom: 10px;
-            font-size: 30px;
-            font-weight: 700;
+        .hero {
+            padding: 34px 34px 20px 34px;
+            border-bottom: 1px solid rgba(123, 144, 236, 0.2);
         }
-        .subtitle {
-            text-align: center;
-            color: #64748b;
-            margin-bottom: 15px;
-            font-size: 16px;
+        .hero-top { display: flex; justify-content: space-between; align-items: center; gap: 16px; }
+        .brand {
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 12px;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            color: #bed3ff;
+            background: rgba(109, 139, 255, 0.2);
+            border: 1px solid rgba(153, 184, 255, 0.32);
+            border-radius: 999px;
+            padding: 8px 12px;
         }
-        .model-badge {
-            text-align: center;
-            margin-bottom: 25px;
+        .brand i {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--accent-2);
+            box-shadow: 0 0 10px rgba(83, 225, 210, 0.8);
         }
-        .model-badge span {
-            background: linear-gradient(135deg, #8b5cf6 0%, #6366f1 100%);
-            color: white;
-            padding: 6px 16px;
-            border-radius: 20px;
-            font-size: 14px;
-            font-weight: 600;
-        }
+        h1 { margin-top: 14px; font-size: clamp(26px, 4vw, 38px); font-weight: 700; letter-spacing: -0.02em; }
+        .subtitle { margin-top: 10px; color: var(--text-sub); font-size: 15px; }
         .status-bar {
+            margin-top: 20px;
             display: flex;
             align-items: center;
             gap: 12px;
-            background: #f8fafc;
-            padding: 16px 20px;
+            border: 1px solid rgba(139, 159, 237, 0.22);
+            background: rgba(12, 20, 49, 0.82);
             border-radius: 14px;
-            margin-bottom: 25px;
+            padding: 12px 14px;
         }
         .status-dot {
-            width: 14px;
-            height: 14px;
+            width: 10px;
+            height: 10px;
             border-radius: 50%;
-            background: #9ca3af;
-            transition: all 0.3s;
+            background: #717f9f;
+            transition: all 0.3s ease;
         }
-        .status-dot.connected {
-            background: #10b981;
-            animation: pulse 2s infinite;
-        }
-        .status-dot.recording {
-            background: #ef4444;
-            animation: pulse-red 0.5s infinite;
-        }
-        @keyframes pulse {
-            0%, 100% { opacity: 1; transform: scale(1); }
-            50% { opacity: 0.6; transform: scale(1.1); }
-        }
-        @keyframes pulse-red {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.4; }
-        }
-        .status-text {
-            color: #475569;
-            font-weight: 500;
-            flex: 1;
-        }
-        .controls {
-            display: flex;
-            gap: 15px;
-            margin-bottom: 25px;
-        }
-        .btn {
-            flex: 1;
-            padding: 18px 24px;
-            font-size: 18px;
-            font-weight: 600;
-            border: none;
-            border-radius: 14px;
-            cursor: pointer;
-            transition: all 0.3s;
-            display: flex;
+        .status-dot.connected { background: #36d7a4; box-shadow: 0 0 12px rgba(54, 215, 164, 0.82); animation: pulse 2s infinite; }
+        .status-dot.recording { background: #ff5b8f; box-shadow: 0 0 14px rgba(255, 91, 143, 0.75); animation: pulse-red 0.9s infinite; }
+        .status-text { color: #c7d5ff; font-size: 14px; }
+        .toolbar {
+            padding: 22px 34px 10px 34px;
+            display: grid;
+            grid-template-columns: 220px 1fr;
+            gap: 16px;
             align-items: center;
-            justify-content: center;
-            gap: 10px;
+        }
+        .mode-selector label {
+            display: block;
+            font-size: 12px;
+            color: #9eb0de;
+            margin-bottom: 8px;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+        }
+        .mode-selector select {
+            width: 100%;
+            appearance: none;
+            border-radius: 12px;
+            border: 1px solid rgba(138, 161, 244, 0.5);
+            background: linear-gradient(160deg, rgba(34, 46, 95, 0.75), rgba(14, 20, 42, 0.88));
+            color: #eef2ff;
+            font-size: 15px;
+            padding: 12px 14px;
+            outline: none;
+        }
+        .controls { display: flex; gap: 12px; }
+        .btn {
+            border: none;
+            border-radius: 12px;
+            padding: 13px 14px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s ease, box-shadow 0.2s ease, opacity 0.2s ease;
+            width: 100%;
         }
         .btn-primary {
-            background: linear-gradient(135deg, #8b5cf6 0%, #6366f1 100%);
-            color: white;
-        }
-        .btn-primary:hover:not(:disabled) {
-            transform: translateY(-2px);
-            box-shadow: 0 12px 28px rgba(139, 92, 246, 0.35);
+            color: #f6f9ff;
+            background: linear-gradient(135deg, #5e7dff 0%, #3cc3ff 100%);
+            box-shadow: 0 10px 24px rgba(80, 136, 255, 0.34);
         }
         .btn-danger {
-            background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
-            color: white;
+            color: #fff2f7;
+            background: linear-gradient(135deg, #ff4f88 0%, #ff7a4f 100%);
+            box-shadow: 0 10px 24px rgba(255, 96, 136, 0.33);
         }
-        .btn-danger:hover:not(:disabled) {
-            transform: translateY(-2px);
-            box-shadow: 0 12px 28px rgba(239, 68, 68, 0.35);
-        }
-        .btn:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-        }
-        .result-container {
-            background: #0f172a;
-            border-radius: 18px;
-            padding: 28px;
-            min-height: 220px;
-            max-height: 400px;
-            overflow-y: auto;
-        }
-        .result-label {
-            color: #94a3b8;
-            font-size: 13px;
-            font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            margin-bottom: 12px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        .segment-count {
-            background: #334155;
-            color: #e2e8f0;
-            padding: 2px 10px;
-            border-radius: 10px;
-            font-size: 12px;
-        }
-        .result-text {
-            color: #f1f5f9;
-            font-size: 22px;
-            line-height: 1.8;
-            word-wrap: break-word;
-            font-family: 'SF Mono', 'Fira Code', monospace;
-        }
-        .result-text.empty {
-            color: #475569;
-            font-style: italic;
-        }
+        .btn:hover:not(:disabled) { transform: translateY(-2px); }
+        .btn:disabled { opacity: 0.45; cursor: not-allowed; }
+        .main { padding: 14px 34px 34px 34px; }
         .waveform {
-            margin-top: 25px;
-            height: 80px;
-            background: #f1f5f9;
-            border-radius: 12px;
+            height: 84px;
+            border-radius: 14px;
+            background: rgba(12, 20, 49, 0.9);
+            border: 1px solid rgba(124, 149, 240, 0.24);
             display: flex;
             align-items: center;
             justify-content: center;
             gap: 4px;
-            padding: 15px;
+            padding: 14px;
         }
         .wave-bar {
-            width: 5px;
-            background: linear-gradient(135deg, #8b5cf6 0%, #6366f1 100%);
-            border-radius: 3px;
-            transition: height 0.08s;
-        }
-        .languages {
-            margin-top: 15px;
-            display: flex;
-            flex-wrap: wrap;
-            gap: 8px;
-            justify-content: center;
-        }
-        .lang-tag {
-            background: #f3f4f6;
-            color: #374151;
-            padding: 6px 14px;
-            border-radius: 20px;
-            font-size: 13px;
-            font-weight: 500;
-        }
-        .info-box {
-            margin-top: 25px;
-            padding: 18px 22px;
-            background: #ede9fe;
-            border-radius: 12px;
-            border-left: 4px solid #8b5cf6;
-        }
-        .info-box p {
-            color: #581c87;
-            font-size: 14px;
-            line-height: 1.6;
+            width: 4px;
+            background: linear-gradient(180deg, #6f8eff 0%, #4ae7ca 100%);
+            border-radius: 999px;
+            transition: height 0.08s linear;
         }
         .stats {
             display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 15px;
-            margin-top: 25px;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 12px;
+            margin-top: 14px;
         }
         .stat-card {
-            background: #f8fafc;
-            padding: 18px;
+            border: 1px solid rgba(130, 149, 218, 0.2);
+            background: rgba(13, 20, 47, 0.7);
             border-radius: 12px;
+            padding: 14px;
             text-align: center;
         }
-        .stat-value {
-            font-size: 28px;
-            font-weight: 700;
-            color: #1e293b;
+        .stat-value { font-size: 23px; font-weight: 700; color: #f2f6ff; }
+        .stat-label { margin-top: 6px; font-size: 12px; color: #93a1c6; }
+        .result-container {
+            margin-top: 14px;
+            min-height: 240px;
+            max-height: 430px;
+            overflow-y: auto;
+            border: 1px solid rgba(142, 163, 244, 0.24);
+            background: rgba(8, 13, 35, 0.96);
+            border-radius: 14px;
+            padding: 18px 18px 24px 18px;
         }
-        .stat-label {
-            font-size: 13px;
-            color: #64748b;
-            margin-top: 5px;
+        .result-label {
+            color: #9cb2ef;
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 10px;
+        }
+        .segment-count {
+            padding: 3px 9px;
+            border-radius: 999px;
+            background: rgba(65, 90, 171, 0.34);
+            color: #dce5ff;
+            font-size: 12px;
+        }
+        .result-text {
+            color: #f5f7ff;
+            font-size: clamp(18px, 2.2vw, 24px);
+            line-height: 1.8;
+            word-wrap: break-word;
+            letter-spacing: 0.01em;
+        }
+        .result-text.empty { color: #7487b8; font-style: italic; }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.55; transform: scale(1.15); }
+        }
+        @keyframes pulse-red {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.4; transform: scale(0.92); }
+        }
+        @media (max-width: 800px) {
+            body { padding: 16px; }
+            .hero, .toolbar, .main { padding-left: 18px; padding-right: 18px; }
+            .toolbar { grid-template-columns: 1fr; }
+            .controls { flex-direction: column; }
+            .stats { grid-template-columns: 1fr; }
         }
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>🎯 智能分段语音识别</h1>
-        <p class="subtitle">VAD 自动断句 + SenseVoice 高准确率识别</p>
-
-        <div class="model-badge">
-            <span>✓ VAD自动断句 ✓ SenseVoice 高准确率</span>
-        </div>
-
-        <div class="languages">
-            <span class="lang-tag">中文</span>
-            <span class="lang-tag">English</span>
-            <span class="lang-tag">日本語</span>
-            <span class="lang-tag">한국어</span>
-            <span class="lang-tag">粤语</span>
-        </div>
-
-        <div class="status-bar" style="margin-top: 25px;">
-            <div class="status-dot" id="statusDot"></div>
-            <span class="status-text" id="statusText">正在连接...</span>
-        </div>
-
-        <div class="controls">
-            <button class="btn btn-primary" id="startBtn" disabled>
-                🎙️ 开始识别
-            </button>
-            <button class="btn btn-danger" id="stopBtn" disabled>
-                ⏹️ 停止识别
-            </button>
-        </div>
-
-        <div class="waveform" id="waveform"></div>
-
-        <div class="stats" id="stats" style="display: none;">
-            <div class="stat-card">
-                <div class="stat-value" id="segmentCount">0</div>
-                <div class="stat-label">已识别句子</div>
+    <div class="shell">
+        <section class="hero">
+            <div class="hero-top">
+                <span class="brand"><i></i>Voice Workspace</span>
             </div>
-            <div class="stat-card">
-                <div class="stat-value" id="audioLength">0s</div>
-                <div class="stat-label">音频时长</div>
+            <h1>语音速记台</h1>
+            <p class="subtitle">实时采集语音并快速生成可编辑文本</p>
+            <div class="status-bar">
+                <div class="status-dot" id="statusDot"></div>
+                <span class="status-text" id="statusText">正在连接服务...</span>
             </div>
-            <div class="stat-card">
-                <div class="stat-value" id="isRecording">否</div>
-                <div class="stat-label">录音状态</div>
+        </section>
+        <section class="toolbar">
+            <div class="mode-selector">
+                <label for="langMode">语言</label>
+                <select id="langMode">
+                    <option value="zh">中文</option>
+                    <option value="en">English</option>
+                </select>
             </div>
-        </div>
-
-        <div class="result-container" style="margin-top: 25px;">
-            <div class="result-label">
-                识别结果
-                <span class="segment-count" id="segmentCountBadge">0 个句子</span>
+            <div class="controls">
+                <button class="btn btn-primary" id="startBtn" disabled>开始录音</button>
+                <button class="btn btn-danger" id="stopBtn" disabled>结束录音</button>
             </div>
-            <div class="result-text empty" id="resultText">点击"开始识别"开始说话...<br>VAD 会自动检测停顿切分句子，每句实时识别</div>
-        </div>
-
-        <div class="info-box">
-            <p><strong>工作原理：</strong>Silero VAD 检测语音活动，自动根据停顿切分成句子，每个句子送给 SenseVoice 识别。结合了 VAD 切分能力和 SenseVoice 高准确率，既不会累积变慢，识别效果又比纯流式 Zipformer 好。</p>
-        </div>
+        </section>
+        <section class="main">
+            <div class="waveform" id="waveform"></div>
+            <div class="stats" id="stats" style="display: none;">
+                <div class="stat-card">
+                    <div class="stat-value" id="segmentCount">0</div>
+                    <div class="stat-label">段落数</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="audioLength">0s</div>
+                    <div class="stat-label">录音时长</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="isRecording">否</div>
+                    <div class="stat-label">录音状态</div>
+                </div>
+            </div>
+            <div class="result-container">
+                <div class="result-label">
+                    识别文本
+                    <span class="segment-count" id="segmentCountBadge">0 段</span>
+                </div>
+                <div class="result-text empty" id="resultText">点击“开始录音”后即可说话，文本将实时显示在这里。</div>
+            </div>
+        </section>
     </div>
 
     <script>
@@ -343,7 +322,7 @@
             ws = new WebSocket(wsUrl);
 
             ws.onopen = () => {
-                statusText.textContent = '已连接 - VAD+SenseVoice 就绪';
+                statusText.textContent = '已连接，准备开始';
                 statusDot.className = 'status-dot connected';
                 startBtn.disabled = false;
             };
@@ -424,7 +403,7 @@
                     resultText.classList.remove('empty');
                     stats.style.display = 'grid';
                     segmentCountEl.textContent = '0';
-                    segmentCountBadge.textContent = '0 个句子';
+                    segmentCountBadge.textContent = '0 段';
                     audioLengthEl.textContent = '0s';
                     startTime = Date.now();
                     totalSamples = 0;
@@ -443,7 +422,7 @@
                     }
                     if (data.segments !== undefined) {
                         segmentCountEl.textContent = data.segments;
-                        segmentCountBadge.textContent = data.segments + ' 个句子';
+                        segmentCountBadge.textContent = data.segments + ' 段';
                     }
                     if (data.final) {
                         resultText.style.fontWeight = 'bold';
@@ -478,7 +457,7 @@
                     }
                     if (data.segments !== undefined) {
                         segmentCountEl.textContent = data.segments;
-                        segmentCountBadge.textContent = data.segments + ' 个句子';
+                        segmentCountBadge.textContent = data.segments + ' 段';
                     }
                     break;
 
@@ -527,14 +506,17 @@
                 sourceNode.connect(processor);
                 processor.connect(audioContext.destination);
 
-                // 开始识别会话
-                ws.send(JSON.stringify({ type: 'start' }));
+                // 开始识别会话，附带语言模式
+                const langMode = document.getElementById('langMode').value;
+                ws.send(JSON.stringify({ type: 'start', mode: langMode }));
                 isRecording = true;
 
+                document.getElementById('langMode').disabled = true;
                 startBtn.disabled = true;
                 stopBtn.disabled = false;
                 statusDot.className = 'status-dot recording';
-                statusText.textContent = '正在录音 - VAD自动断句识别中';
+                const modeLabel = langMode === 'en' ? 'English' : '中文';
+                statusText.textContent = '正在录音（' + modeLabel + '）';
                 isRecordingEl.textContent = '是';
 
             } catch (err) {
@@ -602,11 +584,12 @@
 
             isRecording = false;
             // 停录后先保留最后一次 partial 预览，等服务端最终 result 到来再清空，
-            // 避免出现“识别过程有字，停录瞬间整段消失”的错觉
+            // 避免出现”识别过程有字，停录瞬间整段消失”的错觉
+            document.getElementById('langMode').disabled = false;
             startBtn.disabled = false;
             stopBtn.disabled = true;
             statusDot.className = 'status-dot connected';
-            statusText.textContent = '已连接 - 等待开始';
+            statusText.textContent = '已连接，等待开始';
             isRecordingEl.textContent = '否';
 
             // 重置波形

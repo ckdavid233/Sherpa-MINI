@@ -1,0 +1,11 @@
+# 服务进程依赖（与 start_vad_sensevoice.sh 中 pip 安装一致）
+flask>=2.0
+flask-sock>=0.6
+pyopenssl>=23.0
+numpy>=1.20
+
+# sherpa-onnx：请安装与本机 CUDA / onnxruntime 匹配的版本。
+# 常见方式：
+#   - PyPI: pip install sherpa-onnx（需已有 onnxruntime[-gpu]）
+#   - Jetson / 特殊环境：使用项目提供的 wheel 或按 sherpa-onnx 官方文档源码编译
+sherpa-onnx
