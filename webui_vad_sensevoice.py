@@ -49,7 +49,7 @@ LANGUAGE_PRESETS = {
         "vad_min_silence": 0.22,
         "vad_min_speech": 0.10,
         "vad_max_speech": 12.0,
-        "overlap_threshold": 0.78,   # 偏高：中文音节短，避免误删句首
+        "overlap_threshold": 0.76,   # 偏高：中文音节短，避免误删句首
     },
     "en": {
         "language": "en",
@@ -627,7 +627,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="sherpa-onnx HTTPS VAD + SenseVoice 分段识别")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="监听地址")
-    parser.add_argument("--port", type=int, default=6010, help="监听端口")
+    parser.add_argument("--port", type=int, default=6020, help="监听端口")
     parser.add_argument("--cert", type=str, default="cert.pem", help="证书文件")
     parser.add_argument("--no-ssl", action="store_true", help="不使用 HTTPS")
     parser.add_argument("--provider", type=str, default="cuda", help="ONNX 推理后端: cuda / cpu（默认 cuda）")
